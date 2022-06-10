@@ -62,6 +62,9 @@ public class CodeCovServiceImpl implements CodeCovService {
     private MavenModuleUtil mavenModuleUtil;
 
     @Autowired
+    private GradleModuleUtil gradleModuleUtil;
+
+    @Autowired
     private UnitTester unitTester;
 
     @Autowired
@@ -246,27 +249,54 @@ public class CodeCovServiceImpl implements CodeCovService {
         //编译代码
         coverageReport.setRequestStatus(Constants.JobStatus.COMPILING.val());
         coverageReportDao.updateCoverageReportByReport(coverageReport);
-        codeCompilerExecutor.compileCode(coverageReport);
-        coverageReportDao.updateCoverageReportByReport(coverageReport);
-        if (coverageReport.getRequestStatus() != JobStatus.COMPILE_DONE.val()) {
-            log.info("{}计算覆盖率具体步骤...编译失败uuid={}", Thread.currentThread().getName(), coverageReport.getUuid());
-            return;
+        if(gradleModuleUtil.isGradle(coverageReport.getNowLocalPath())){//新增，如果是gradle项目，以gradle build的方式编译
+            gradleModuleUtil.gradleBuild(coverageReport);
+            coverageReportDao.updateCoverageReportByReport(coverageReport);
+            if (coverageReport.getRequestStatus() != JobStatus.COMPILE_DONE.val()) {
+                log.info("{}计算覆盖率具体步骤...编译失败uuid={}", Thread.currentThread().getName(), coverageReport.getUuid());
+                return;
+            }
+            DeployInfoEntity deployInfo = new DeployInfoEntity();
+            deployInfo.setUuid(coverageReport.getUuid());
+            deployInfo.setCodePath(coverageReport.getNowLocalPath());
+            String pomPath = deployInfo.getCodePath() + "/settings.gradle";
+            ArrayList<String> moduleList = gradleModuleUtil.gradleProjects(pomPath);
+            StringBuilder moduleNames = new StringBuilder("");
+            for (String module : moduleList) {
+                moduleNames.append(module + ",");
+            }
+            deployInfo.setChildModules(moduleNames.toString());
+            int i = deployInfoDao.updateDeployInfo(deployInfo);
+            if (i < 1) {
+                log.info("{}计算覆盖率具体步骤...获取ChildModules失败uuid={}", Thread.currentThread().getName(), coverageReport.getUuid());
+                return;
+            }
+        }else
+        {
+            codeCompilerExecutor.compileCode(coverageReport);
+            coverageReportDao.updateCoverageReportByReport(coverageReport);
+            if (coverageReport.getRequestStatus() != JobStatus.COMPILE_DONE.val()) {
+                log.info("{}计算覆盖率具体步骤...编译失败uuid={}", Thread.currentThread().getName(), coverageReport.getUuid());
+                return;
+            }
+            DeployInfoEntity deployInfo = new DeployInfoEntity();
+            deployInfo.setUuid(coverageReport.getUuid());
+            deployInfo.setCodePath(coverageReport.getNowLocalPath());
+            String pomPath = deployInfo.getCodePath() + "/pom.xml";
+            ArrayList<String> moduleList = MavenModuleUtil.getValidModules(pomPath);
+            StringBuilder moduleNames = new StringBuilder("");
+            for (String module : moduleList) {
+                moduleNames.append(module + ",");
+            }
+            deployInfo.setChildModules(moduleNames.toString());
+            int i = deployInfoDao.updateDeployInfo(deployInfo);
+            if (i < 1) {
+                log.info("{}计算覆盖率具体步骤...获取ChildModules失败uuid={}", Thread.currentThread().getName(), coverageReport.getUuid());
+                return;
+            }
         }
-        DeployInfoEntity deployInfo = new DeployInfoEntity();
-        deployInfo.setUuid(coverageReport.getUuid());
-        deployInfo.setCodePath(coverageReport.getNowLocalPath());
-        String pomPath = deployInfo.getCodePath() + "/pom.xml";
-        ArrayList<String> moduleList = MavenModuleUtil.getValidModules(pomPath);
-        StringBuilder moduleNames = new StringBuilder("");
-        for (String module : moduleList) {
-            moduleNames.append(module + ",");
-        }
-        deployInfo.setChildModules(moduleNames.toString());
-        int i = deployInfoDao.updateDeployInfo(deployInfo);
-        if (i < 1) {
-            log.info("{}计算覆盖率具体步骤...获取ChildModules失败uuid={}", Thread.currentThread().getName(), coverageReport.getUuid());
-            return;
-        }
+
+
     }
 
     /**
@@ -305,6 +335,8 @@ public class CodeCovServiceImpl implements CodeCovService {
             deployInfoDao.insertDeployId(envCoverRequest.getUuid(), envCoverRequest.getAddress(), envCoverRequest.getPort());
             new Thread(() -> {
                 cloneAndCompileCode(coverageReport);
+                log.info("任务uuid={},当前状态{}",coverageReport.getUuid(),JobStatus.desc(coverageReport.getRequestStatus()));
+
                 if (coverageReport.getRequestStatus() != Constants.JobStatus.COMPILE_DONE.val()) {
                     log.info("{}计算覆盖率具体步骤...编译失败uuid={}", Thread.currentThread().getName(), coverageReport.getUuid());
                     return;
@@ -346,18 +378,20 @@ public class CodeCovServiceImpl implements CodeCovService {
                     deployInfoEntity.getPort() + " --destfile ./jacoco.exec"}, CMD_TIMEOUT);
 
             if (exitCode == 0) {
-                CmdExecutor.executeCmd(new String[]{"rm -rf " + REPORT_PATH + coverageReport.getUuid()}, CMD_TIMEOUT);
+//                CmdExecutor.executeCmd(new String[]{"rm -rf " + REPORT_PATH + coverageReport.getUuid()}, CMD_TIMEOUT); //注释。cp时自动覆盖
                 String[] moduleList = deployInfoEntity.getChildModules().split(",");
                 StringBuilder builder = new StringBuilder("java -jar " + JACOCO_PATH + " report " + deployInfoEntity.getCodePath() + "/jacoco.exec ");
                 // 单模块的时候没有moduleList
                 if (moduleList.length == 0) {
                     builder.append("--sourcefiles ./src/main/java/ ");
-                    builder.append("--classfiles ./target/classes/com/ ");
+                    builder.append(this.classfiles(coverageReport.getNowLocalPath(),""));
+
                 } else {
                     // 多模块
                     for (String module : moduleList) {
                         builder.append("--sourcefiles ./" + module + "/src/main/java/ ");
-                        builder.append("--classfiles ./" + module + "/target/classes/com/ ");
+                        builder.append(this.classfiles(coverageReport.getNowLocalPath(),module));
+
                     }
                 }
                 if (!StringUtils.isEmpty(coverageReport.getDiffMethod())) {
@@ -408,8 +442,8 @@ public class CodeCovServiceImpl implements CodeCovService {
                     ArrayList<String> childReportList = new ArrayList<>();
                     for (String module : moduleList) {
                         StringBuilder buildertmp = new StringBuilder("java -jar " + JACOCO_PATH + " report ./jacoco.exec");
-                        buildertmp.append(" --sourcefiles ./" + module + "/src/main/java/");
-                        buildertmp.append(" --classfiles ./" + module + "/target/classes/com/");
+                        buildertmp.append(" --sourcefiles ./" + module + "/src/main/java/ ");
+                        buildertmp.append(this.classfiles(coverageReport.getNowLocalPath(),module));
                         if (!StringUtils.isEmpty(coverageReport.getDiffMethod())) {
                             builder.append("--diffFile " + coverageReport.getDiffMethod());
                         }
@@ -427,7 +461,7 @@ public class CodeCovServiceImpl implements CodeCovService {
                         if (result[0] > 0) {
                             coverageReport.setReportUrl(LocalIpUtils.getTomcatBaseUrl() + coverageReport.getUuid() + "/index.html");
                             coverageReport.setRequestStatus(Constants.JobStatus.SUCCESS.val());
-                            FileUtil.cleanDir(new File(coverageReport.getNowLocalPath()).getParent());
+//                            FileUtil.cleanDir(new File(coverageReport.getNowLocalPath()).getParent());//不需要删除
                             CmdExecutor.executeCmd(new String[]{"cp -r " + JACOCO_RESOURE_PATH + " " + REPORT_PATH + coverageReport.getUuid()}, CMD_TIMEOUT);
                             coverageReport.setLineCoverage(Double.valueOf(result[2]));
                             coverageReport.setBranchCoverage(Double.valueOf(result[1]));
@@ -505,12 +539,14 @@ public class CodeCovServiceImpl implements CodeCovService {
                 // 单模块的时候没有moduleList
                 if (subModule.isEmpty()) {
                     builder.append("--sourcefiles ./src/main/java/ ");
-                    builder.append("--classfiles ./target/classes/com/ ");
+                    builder.append(this.classfiles(localHostRequestParam.getNowPath(),""));
+
                 } else {
                     // 多模块
 
                     builder.append("--sourcefiles ./" + subModule + "/src/main/java/ ");
-                    builder.append("--classfiles ./" + subModule + "/target/classes/com/ ");
+                    builder.append(this.classfiles(localHostRequestParam.getNowPath(),subModule));
+
 
                 }
                 if (!StringUtils.isEmpty(diffFiles)) {
@@ -564,8 +600,9 @@ public class CodeCovServiceImpl implements CodeCovService {
                     ArrayList<String> childReportList = new ArrayList<>();
 
                     StringBuilder buildertmp = new StringBuilder("java -jar " + JACOCO_PATH + " report ./jacoco.exec");
-                    buildertmp.append(" --sourcefiles ./" + subModule + "/src/main/java/");
-                    buildertmp.append(" --classfiles ./" + subModule + "/target/classes/com/");
+                    buildertmp.append(" --sourcefiles ./" + subModule + "/src/main/java/ ");
+                    builder.append(this.classfiles(localHostRequestParam.getNowPath(),subModule));
+
                     if (!StringUtils.isEmpty(diffFiles)) {
                         builder.append("--diffFile " + diffFiles);
                     }
@@ -628,6 +665,25 @@ public class CodeCovServiceImpl implements CodeCovService {
             execFileLoader.save(new File(NewFileName), false);
         } catch (Exception e) {
             log.error("ExecFiles 保存失败 errorMessege is {}", e.fillInStackTrace());
+        }
+    }
+
+    private String classfiles(String rootPath,String module)
+    {
+        if(StringUtils.isEmpty(module)){
+            if(gradleModuleUtil.isGradle(rootPath)){
+                return "--classfiles ./build/classes/java/ ";
+            }else
+            {
+                return "--classfiles ./target/classes/com/ ";
+            }
+        }else{
+            if(gradleModuleUtil.isGradle(rootPath)){
+                return "--classfiles ./"+module+"/build/classes/java/ ";
+            }else
+            {
+                return "--classfiles ./"+module+"/target/classes/com/ ";
+            }
         }
     }
 }
